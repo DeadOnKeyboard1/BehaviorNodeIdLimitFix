@@ -1,0 +1,16 @@
+/build/
+/build-logs/
+/dist/
+/_toolchain/
+/_references/
+/deps/
+/.vs/
+CMakeUserPresets.json
+__pycache__/
+*.dll
+*.pdb
+*.obj
+*.lib
+*.exp
+*.zip
+*.log
