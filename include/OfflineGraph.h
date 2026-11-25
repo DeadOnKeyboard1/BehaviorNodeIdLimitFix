@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GraphSlimming.h"
+#include "HkxTiming.h"
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -41,13 +42,20 @@ namespace OfflineGraph
 		unsigned admitted{};
 		unsigned belowLimit{};
 		unsigned unsupported{};
+		unsigned deferred{};
+		unsigned notAdmitted{};
 		std::uint64_t sourceBytesRead{};
+		HkxTiming::Stats sourceIO;
+		GraphPerformance::LatencyStats sourceDecode;
 		bool interrupted{};
+		bool catalogLimited{};
+		bool virtualFilesystem{};
 	};
 
 	using Publish = bool (*)(Candidate&&) noexcept;
 	using Progress = void (*)(unsigned checked, unsigned selected) noexcept;
 	[[nodiscard]] Summary Prepare(const std::filesystem::path& meshes, const std::filesystem::path& directory,
-		const std::atomic_bool& stop, Publish publish, Progress progress) noexcept;
+		const std::atomic_bool& stop, Publish publish, Progress progress, unsigned maxPlans = 128,
+		bool measureIO = false) noexcept;
 }
 

@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 #include <atomic>
+#include <format>
 #include <mutex>
 #include <utility>
 
@@ -12,6 +13,8 @@ namespace
 	constexpr DWORD reportPeriodMs = 3000;
 	constexpr std::size_t detailCapacity = 64;
 	constexpr auto hookCount = static_cast<std::size_t>(GraphPerformance::Hook::count);
+	constexpr const char* sources[]{"BShkbLink", "initNodeIds"};
+	static_assert(std::size(sources) == hookCount);
 	struct CounterSlot
 	{
 		std::mutex mutex;
@@ -65,8 +68,6 @@ namespace
 		}
 		if (dropped) logger::info("Graph performance detail rows dropped={}.", dropped);
 		bool wrote = detailCount != 0 || dropped != 0;
-		constexpr const char* sources[]{"BShkbLink", "initNodeIds"};
-		static_assert(std::size(sources) == static_cast<std::size_t>(GraphPerformance::Hook::count));
 		for (std::size_t i = 0; i < recent.size(); ++i) {
 			const auto& data = recent[i];
 			if (!data.calls) continue;
@@ -80,6 +81,13 @@ namespace
 				data.Count(Outcome::offlineTopology), data.Count(Outcome::offlineVerified), data.Count(Outcome::instance),
 				Microseconds(data.nativeTotal), Microseconds(data.nativeMax), data.nativeLatency.P95UpperMicros(data.calls, data.nativeMax),
 				Microseconds(data.pluginTotal), Microseconds(data.pluginMax), data.pluginLatency.P95UpperMicros(data.calls, data.pluginMax));
+			const auto& exclusive = data.nativeExclusive;
+			logger::info("Havok initialization [{}] calls={} externalTargets={} inclusiveTotal={}us "
+				"exclusiveTotal={}us exclusiveMean={}us exclusiveP95Upper={}us exclusiveMax={}us "
+				"nestedHooks={} nestedHookTime={}us callsAtLeast16ms={} callsAtLeast50ms={}",
+				sources[i], data.calls, data.externalTargets, Microseconds(data.nativeTotal),
+				Microseconds(exclusive.total), Microseconds(exclusive.Mean()), exclusive.P95UpperMicros(),
+				Microseconds(exclusive.maximum), data.nestedCalls, Microseconds(data.nestedTime), data.slow16ms, data.slow50ms);
 			wrote = true;
 		}
 		if (firstReport && !wrote) {
@@ -112,12 +120,24 @@ namespace GraphPerformance
 		return true;
 	}
 
-	void Record(Hook hook, Outcome outcome, Duration native, Duration plugin) noexcept
+	void Record(Hook hook, Outcome outcome, HookSample sample) noexcept
 	{
 		if (!collecting.load(std::memory_order_acquire)) return;
-		auto& slot = interval[static_cast<std::size_t>(hook)];
-		std::scoped_lock lock(slot.mutex);
-		slot.counts.Add(outcome, native, plugin);
+		const auto index = static_cast<std::size_t>(hook);
+		auto& slot = interval[index];
+		{
+			std::scoped_lock lock(slot.mutex);
+			slot.counts.Add(outcome, sample);
+		}
+		if (sample.native < slowInitialization || !WantsDetail()) return;
+		try {
+			QueueDetail(std::chrono::system_clock::now(),
+				std::format("Havok initialization slow [{}] thread={} target={} inclusive={}us exclusive={}us plugin={}us nestedHooks={}",
+					sources[index], GetCurrentThreadId(), sample.externalTarget ? "external" : "SkyrimText",
+					Microseconds(sample.native), Microseconds(sample.NativeExclusive()), Microseconds(sample.plugin), sample.nestedCalls));
+		} catch (const std::exception&) {
+			// Detailed timing is optional. The interval sample was already recorded.
+		}
 	}
 
 	bool WantsDetail() noexcept

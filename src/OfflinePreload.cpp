@@ -19,10 +19,8 @@ namespace
 	constexpr std::uint32_t format = 0x3142474fu;
 	constexpr std::uint64_t minSource = (GraphPlan::nodeThreshold + 1u) * 72;
 	constexpr std::uint64_t maxSource = 64u << 20;
-	constexpr std::uint64_t totalSourceBytes = 192u << 20;
-	constexpr std::size_t maxFiles = 32;
+	constexpr std::uint64_t totalSourceBytes = 512u << 20;
 	constexpr std::size_t maxEntries = 32768;
-	constexpr std::size_t maxPlans = 16;
 	constexpr auto zero = std::uint32_t{0};
 
 	struct SourceStamp
@@ -69,18 +67,6 @@ namespace
 		return lhs.path < rhs.path;
 	}
 
-	void KeepSource(std::vector<SourceFile>& files, SourceFile candidate)
-	{
-		if (files.size() < maxFiles) {
-			files.push_back(std::move(candidate));
-		} else {
-			if (!Earlier(candidate, files.front())) return;
-			std::ranges::pop_heap(files, Earlier);
-			files.back() = std::move(candidate);
-		}
-		std::ranges::push_heap(files, Earlier);
-	}
-
 	void ListBehaviorFiles(const Path& directory, std::vector<SourceFile>& files, const std::atomic_bool& stop,
 		std::size_t& remaining, unsigned depth, bool character)
 	{
@@ -99,7 +85,7 @@ namespace
 			}
 			if (!Plain(item.dwFileAttributes, false) || name.size() <= 4 || _wcsnicmp(name.data() + name.size() - 4, L".hkx", 4) != 0) continue;
 			const auto size = (std::uint64_t{item.nFileSizeHigh} << 32) | item.nFileSizeLow;
-			if (size >= minSource && size <= maxSource) KeepSource(files, {directory / name, character});
+			if (size >= minSource && size <= maxSource) files.push_back({directory / name, character});
 		} while (FindNextFileW(handle, &item));
 	}
 
@@ -114,13 +100,17 @@ namespace
 		}
 	}
 
-	bool ReadSource(HANDLE file, std::span<char> bytes, std::uint64_t& totalRead, const std::atomic_bool& stop)
+	bool ReadSource(HANDLE file, std::span<char> bytes, std::uint64_t& totalRead,
+		const std::atomic_bool& stop, HkxTiming::File& timing)
 	{
 		while (!bytes.empty()) {
 			if (stop.load(std::memory_order_relaxed)) return false;
 			const auto request = static_cast<DWORD>((std::min)(bytes.size(), std::size_t{256} << 10));
 			DWORD read{};
-			if (!ReadFile(file, bytes.data(), request, &read, nullptr)) return false;
+			const auto readStart = timing.Now();
+			const bool success = ReadFile(file, bytes.data(), request, &read, nullptr) != FALSE;
+			timing.Read(readStart, success, read, request);
+			if (!success) return false;
 			totalRead += read;
 			if (read != request) return false;
 			bytes = bytes.subspan(read);
@@ -129,19 +119,31 @@ namespace
 	}
 
 	std::optional<OfflineGraph::Analysis> AnalyzeSource(HANDLE file, const SourceStamp& stamp,
-		std::uint64_t& totalRead, const std::atomic_bool& stop)
+		OfflineGraph::Summary& summary, const std::atomic_bool& stop, HkxTiming::File& timing)
 	{
+		auto& totalRead = summary.sourceBytesRead;
 		std::array<char, OfflineGraph::packfileHeaderBytes> header;
-		if (header.size() > totalSourceBytes - totalRead || !ReadSource(file, header, totalRead, stop)) return {};
+		if (header.size() > totalSourceBytes - totalRead) {
+			++summary.deferred;
+			return {};
+		}
+		if (!ReadSource(file, header, totalRead, stop, timing)) return {};
 		if (const auto screened = OfflineGraph::ScreenHeader(header, stamp.size)) return OfflineGraph::Analysis{*screened, {}};
 
 		const auto remaining = stamp.size - header.size();
-		if (remaining > totalSourceBytes - totalRead || stop.load(std::memory_order_relaxed)) return {};
+		if (remaining > totalSourceBytes - totalRead) {
+			++summary.deferred;
+			return {};
+		}
+		if (stop.load(std::memory_order_relaxed)) return {};
 		auto bytes = std::make_unique_for_overwrite<char[]>(static_cast<std::size_t>(stamp.size));
 		std::memcpy(bytes.get(), header.data(), header.size());
 		const std::span data{bytes.get(), static_cast<std::size_t>(stamp.size)};
-		if (!ReadSource(file, data.subspan(header.size()), totalRead, stop)) return {};
-		return OfflineGraph::Analyze(data, stop);
+		if (!ReadSource(file, data.subspan(header.size()), totalRead, stop, timing)) return {};
+		const auto decodeStart = timing.Now();
+		auto result = OfflineGraph::Analyze(data, stop);
+		if (timing.Enabled()) summary.sourceDecode.Add(OfflineGraph::Clock::now() - decodeStart);
+		return result;
 	}
 
 	template <class T>
@@ -236,21 +238,22 @@ namespace
 
 namespace OfflineGraph
 {
-	Summary Prepare(const Path& meshes, const Path& directory, const std::atomic_bool& stop, Publish publish, Progress progress) noexcept
+	Summary Prepare(const Path& meshes, const Path& directory, const std::atomic_bool& stop, Publish publish, Progress progress,
+		unsigned maxPlans, bool measureIO) noexcept
 	{
 		Summary summary;
 		try {
 			if (stop.load(std::memory_order_relaxed)) return {.interrupted = true};
-			if (GetModuleHandleW(L"usvfs_x64.dll")) return summary;
+			if (GetModuleHandleW(L"usvfs_x64.dll")) return {.virtualFilesystem = true};
 			const auto actors = meshes / L"actors";
 			if (!directory.is_absolute() || !actors.is_absolute() || !publish || !Plain(GetFileAttributesW(actors.c_str()), true)) return summary;
 			std::vector<SourceFile> files;
-			files.reserve(maxFiles);
+			files.reserve(64);
 			std::size_t remaining = maxEntries;
 			const auto character = actors / L"character";
 			const bool foundCharacter = Plain(GetFileAttributesW(character.c_str()), true);
 			if (foundCharacter) ListActorBehaviors(character, files, stop, remaining, true);
-			if (files.size() < maxFiles && remaining && !stop.load(std::memory_order_relaxed)) {
+			if (remaining && !stop.load(std::memory_order_relaxed)) {
 				WIN32_FIND_DATAW item{};
 				const auto search = FindFirstFileW((actors / L"*").c_str(), &item);
 				if (search != INVALID_HANDLE_VALUE) {
@@ -268,17 +271,20 @@ namespace OfflineGraph
 				}
 			}
 			if (stop.load(std::memory_order_relaxed)) return {.interrupted = true};
-			std::ranges::sort_heap(files, Earlier);
+			summary.catalogLimited = remaining == 0;
+			std::ranges::sort(files, Earlier);
 			const auto count = static_cast<unsigned>(files.size());
 			if (count && progress && !stop.load(std::memory_order_relaxed)) progress(0, count);
 			for (const auto& source : files) {
 				if (stop.load(std::memory_order_relaxed)) break;
-				if (summary.admitted >= maxPlans) break;
 				const auto& path = source.path;
 				++summary.checked;
 				try {
+					HkxTiming::File timing(measureIO ? &summary.sourceIO : nullptr);
+					const auto openStart = timing.Now();
 					const auto handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 						nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+					timing.Opened(openStart, handle != INVALID_HANDLE_VALUE);
 					if (handle != INVALID_HANDLE_VALUE) {
 						const std::unique_ptr<void, decltype(&CloseHandle)> close(handle, CloseHandle);
 						const auto stamp = Identify(handle);
@@ -286,7 +292,7 @@ namespace OfflineGraph
 							const auto cache = CacheName(directory, path, meshes);
 							auto result = ReadCache(cache, *stamp);
 							const bool reused = result.has_value();
-							if (!result) result = AnalyzeSource(handle, *stamp, summary.sourceBytesRead, stop);
+							if (!result) result = AnalyzeSource(handle, *stamp, summary, stop, timing);
 							if (result && result->status != Status::cancelled &&
 								!stop.load(std::memory_order_relaxed) && Identify(handle) == stamp) {
 								if (reused) ++summary.reused;
@@ -301,7 +307,10 @@ namespace OfflineGraph
 								if (stop.load(std::memory_order_relaxed)) break;
 								if (result->status == Status::belowLimit) ++summary.belowLimit;
 								if (result->status == Status::unsupported) ++summary.unsupported;
-								if (result->candidate && publish(std::move(*result->candidate))) ++summary.admitted;
+								if (result->candidate) {
+									if (summary.admitted < maxPlans && publish(std::move(*result->candidate))) ++summary.admitted;
+									else ++summary.notAdmitted;
+								}
 							}
 						}
 					}

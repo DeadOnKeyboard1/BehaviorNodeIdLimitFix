@@ -72,6 +72,8 @@ namespace
 	RE::hkContainerHeapAllocator::Allocator* g_heapAllocator = nullptr;
 	PreSetupBehaviorGraphFn g_origPreSetup = nullptr;
 	InitNodeIdsFn           g_origInitNodeIds = nullptr;
+	bool g_preSetupExternalTarget{};
+	bool g_initNodeIdsExternalTarget{};
 	std::mutex g_compactionMutex;
 
 	[[nodiscard]] std::uintptr_t DecodeCallRel32(std::uintptr_t a_callSite) noexcept
@@ -494,6 +496,12 @@ namespace
 		std::uintptr_t bound{};
 		std::uintptr_t children{};
 		const std::uintptr_t* clipTable{};
+		std::uintptr_t clipClassMethod{};
+
+		[[nodiscard]] bool IsVerifiedClip(const std::uintptr_t* table) const noexcept
+		{
+			return clipTable && table == clipTable && table[1] == clipClassMethod;
+		}
 	};
 
 	LeafMethods VerifiedLeafMethods()
@@ -521,7 +529,7 @@ namespace
 				std::int32_t displacement{};
 				std::memcpy(&displacement, bytes + 3, sizeof(displacement));
 				const auto type = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(target + 7) + displacement);
-				if (type != reinterpret_cast<std::uintptr_t>(g_stateMachineClass)) return {bound, children, table};
+				if (type != reinterpret_cast<std::uintptr_t>(g_stateMachineClass)) return {bound, children, table, getClass};
 			}
 		}
 		return {bound, children, nullptr};
@@ -530,7 +538,7 @@ namespace
 	bool IsStateMachine(RE::hkbNode* node, LeafMethods leaf, std::size_t& verifiedTypes)
 	{
 		const auto* vtable = *reinterpret_cast<const std::uintptr_t* const*>(node);
-		if (leaf.clipTable && vtable == leaf.clipTable) {
+		if (leaf.IsVerifiedClip(vtable)) {
 			++verifiedTypes;
 			return false;
 		}
@@ -601,26 +609,58 @@ namespace
 		std::size_t childCapacity = localChildren.size();
 	};
 
+	template <bool classifyFirst = true, class Check>
+	bool VerifyCachedNode(RE::hkbNode* node, bool expectedMachine, ChildEnumerator& children, LeafMethods leaf,
+		std::size_t& verifiedLeaves, std::size_t& verifiedTypes, const GraphLifecycle::Analyses::Ticket& analysis, Check check)
+	{
+		if (!analysis.IsCurrent()) return false;
+		if (leaf.clipTable) {
+			const auto* vtable = *reinterpret_cast<const std::uintptr_t* const*>(node);
+			if (leaf.IsVerifiedClip(vtable) && vtable[8] == leaf.bound && vtable[9] == leaf.children) {
+				// The verified methods have no callbacks and this node never supplies a child.
+				++verifiedTypes;
+				++verifiedLeaves;
+				return !expectedMachine && check(0, [](std::size_t) -> RE::hkbNode* { return nullptr; });
+			}
+		}
+		const auto matchLinks = [&] {
+			return children.Read(node, leaf, verifiedLeaves, [&](std::span<const NodeChildInfo> live) {
+				return check(live.size(), [&](std::size_t index) { return live[index].node; });
+			});
+		};
+		if constexpr (classifyFirst) {
+			return IsStateMachine(node, leaf, verifiedTypes) == expectedMachine && analysis.IsCurrent() && matchLinks();
+		} else {
+			return matchLinks() && analysis.IsCurrent() && IsStateMachine(node, leaf, verifiedTypes) == expectedMachine;
+		}
+	}
+
 	bool CollectReachableNodes(
-		RE::hkbNode* root, TraversalBuffers& storage, bool largeHint, LeafMethods leaf,
+		RE::hkbNode* root, TraversalBuffers& storage, FlatNodeIndex& visited, std::size_t first, LeafMethods leaf,
 		GraphPlan::Signature& signature, std::size_t& verifiedLeaves, bool foldEmptyNodes,
 		GraphPlan::PreparedCheck& prepared, std::size_t& verifiedTypes, const GraphLifecycle::Analyses::Ticket& analysis)
 	{
 		auto& nodes = storage.nodes;
-		FlatNodeIndex visited(largeHint ? 16384 : 1024, storage.buckets);
 		ChildEnumerator children(storage.childScratch, analysis);
-		if (visited.FindOrAdd(root, nodes) == GraphPlan::noNode) return false;
-		for (std::size_t i = 0; i < nodes.size(); ++i) {
+		if (nodes.empty() && visited.FindOrAdd(root, nodes) == GraphPlan::noNode) return false;
+		std::size_t emptyNodes{};
+		const auto flushEmptyNodes = [&] {
+			if (!emptyNodes) return;
+			if (foldEmptyNodes) signature.AddEmptyNodes(emptyNodes);
+			storage.links.RecordEmptyNodes(emptyNodes);
+			emptyNodes = 0;
+		};
+		for (std::size_t i = first; i < nodes.size(); ++i) {
 			if (!analysis.IsCurrent()) return false;
 			prepared.Observe(i, [&] { return IsStateMachine(nodes[i], leaf, verifiedTypes); });
 			if (!analysis.IsCurrent()) return false;
 			const bool valid = children.Read(nodes[i], leaf, verifiedLeaves, [&](std::span<const NodeChildInfo> live) {
 				if (live.empty()) {
-					if (foldEmptyNodes) signature.AddEmptyNode();
-					else signature.Add(0);
-					storage.links.RecordEmptyNode();
+					if (!foldEmptyNodes) signature.Add(0);
+					++emptyNodes;
 					return true;
 				}
+				flushEmptyNodes();
 				signature.Add(static_cast<std::uint32_t>(live.size()));
 				auto saved = storage.links.RecordChildren(live.size());
 				for (std::size_t j = 0; j < live.size(); ++j) {
@@ -634,27 +674,23 @@ namespace
 			});
 			if (!valid) return false;
 		}
+		flushEmptyNodes();
 		return analysis.IsCurrent();
 	}
 
 	bool ReplayTopology(RE::hkbNode* root, TraversalBuffers& storage, const GraphCache::PreparedPlan& prepared,
-		LeafMethods leaf, std::size_t& verifiedLeaves, std::size_t& verifiedTypes,
+		FlatNodeIndex& visited, std::size_t& verified, LeafMethods leaf, std::size_t& verifiedLeaves, std::size_t& verifiedTypes,
 		const GraphLifecycle::Analyses::Ticket& analysis)
 	{
 		auto& nodes = storage.nodes;
 		const auto ids = prepared.IDs();
-		nodes.reserve(ids.size());
-		FlatNodeIndex visited(ids.size() * 2, storage.buckets);
 		ChildEnumerator children(storage.childScratch, analysis);
 		return prepared.payload->links.Replay(root, nodes, [&](RE::hkbNode* child, std::size_t ordinal) {
 			return visited.FindOrAdd(child, nodes) == ordinal;
 		}, [&](RE::hkbNode* node, std::size_t ordinal, auto check) {
-			if (!analysis.IsCurrent() || IsStateMachine(node, leaf, verifiedTypes) != (ids[ordinal] != kInvalidNodeId) ||
-				!analysis.IsCurrent()) return false;
-			return children.Read(node, leaf, verifiedLeaves, [&](std::span<const NodeChildInfo> live) {
-				return check(live.size(), [&](std::size_t index) { return live[index].node; });
-			});
-		});
+			return VerifyCachedNode(node, ids[ordinal] != kInvalidNodeId, children, leaf,
+				verifiedLeaves, verifiedTypes, analysis, check);
+		}, &verified);
 	}
 
 	[[nodiscard]] bool WritableSpan(std::uintptr_t address, std::size_t bytes, std::size_t alignment) noexcept
@@ -818,10 +854,16 @@ namespace
 
 	ApplyResult ApplyGraphPlan(RE::hkbBehaviorGraph& graph, GraphIdentity identity, const std::vector<RE::hkbNode*>& nodes,
 		const std::vector<std::uint32_t>& stateMachines, CommitMetrics& metrics, const ProcessedGraph* instance = nullptr,
-		std::span<const std::uint16_t> preparedIds = {})
+		const GraphCache::PreparedPlan* preparation = nullptr)
 	{
 		if (!identity.analysis->IsCurrent()) return ApplyResult::graphChanged;
-		if (!GraphPlan::ValidAssignments(nodes.size(), stateMachines, preparedIds) || nodes.front() != identity.root) {
+		// Prepared tables are immutable and generated from a checked entry in the cache.
+		const auto preparedIds = preparation ? preparation->IDs() : std::span<const std::uint16_t>{};
+		const bool valid = preparation ?
+			&preparation->entry->stateMachines == &stateMachines && preparation->entry->nodes == nodes.size() &&
+				preparedIds.size() == nodes.size() :
+			GraphPlan::ValidAssignments(nodes.size(), stateMachines);
+		if (!valid || nodes.empty() || nodes.front() != identity.root) {
 			return ApplyResult::invalidPlan;
 		}
 		// Traversal and disk I/O stay outside the publication lock.
@@ -959,12 +1001,10 @@ namespace
 		if (!previous->payload->links.Matches(static_cast<RE::hkbNode*>(identity.root),
 			std::span<RE::hkbNode* const>{previous->nodes},
 			[&](RE::hkbNode* node, std::size_t ordinal, auto checkLinks) {
-				if (!identity.analysis->IsCurrent() || !children.Read(node, leaf, verifiedLeaves, [&](std::span<const NodeChildInfo> live) {
-					return checkLinks(live.size(), [&](std::size_t index) { return live[index].node; });
-				})) return false;
 				const bool expectedMachine = nextMachine < plan.stateMachines.size() &&
 					plan.stateMachines[nextMachine] == ordinal;
-				if (!identity.analysis->IsCurrent() || IsStateMachine(node, leaf, verifiedClipTypes) != expectedMachine) return false;
+				if (!VerifyCachedNode<false>(node, expectedMachine, children, leaf, verifiedLeaves, verifiedClipTypes,
+					*identity.analysis, checkLinks)) return false;
 				if (expectedMachine) ++nextMachine;
 				return true;
 			}) || nextMachine != plan.stateMachines.size() || initSequence != nativeInitSequence) return {};
@@ -1052,17 +1092,21 @@ namespace
 		auto& trace = traversal.buffers.links;
 		const bool persistentTopology = options.persistentCache && options.adaptivePreloading;
 		const auto startupPlan = persistentTopology ? GraphCache::FindPrepared(name) : nullptr;
-		auto preparedIds = startupPlan ? startupPlan->IDs() : std::span<const std::uint16_t>{};
+		const auto preparedIds = startupPlan ? startupPlan->IDs() : std::span<const std::uint16_t>{};
 		const bool hasTopology = startupPlan && startupPlan->payload;
 		const auto leaf = largeHint || hasTopology ? VerifiedLeafMethods() : LeafMethods{};
 		GraphPlan::Signature signature;
 		std::size_t verifiedLeaves{};
 		std::size_t verifiedClipTypes{};
+		nodes.reserve(hasTopology ? preparedIds.size() : (largeHint ? 16384 : 512));
+		FlatNodeIndex visited(hasTopology ? preparedIds.size() * 2 : (largeHint ? 16384 : 1024), traversal.buffers.buckets);
 		std::optional<bool> replay;
+		std::size_t replayPrefix{};
 		std::size_t verifiedPrefix{};
 		if (hasTopology) {
 			try {
-				replay = ReplayTopology(root, traversal.buffers, *startupPlan, leaf, verifiedLeaves, verifiedClipTypes, analysis);
+				replay = ReplayTopology(root, traversal.buffers, *startupPlan, visited, replayPrefix,
+					leaf, verifiedLeaves, verifiedClipTypes, analysis);
 			} catch (const std::bad_alloc&) {
 				// A failed cache allocation still allows the ordinary path.
 			}
@@ -1071,20 +1115,19 @@ namespace
 		const bool topologyHit = replay.value_or(false);
 		bool startupHit = topologyHit;
 		if (!topologyHit) {
-			nodes.clear();
-			nodes.reserve(largeHint ? 16384 : 512);
 			trace.Reset(options.instanceFastPath || persistentTopology);
-			verifiedLeaves = verifiedClipTypes = 0;
-			// An offline candidate has never been observed in Skyrim. Require
-			// exact replay before letting it supply any IDs.
-			GraphPlan::PreparedCheck startupCheck(startupPlan && !startupPlan->offline ? preparedIds : std::span<const std::uint16_t>{});
-			if (!CollectReachableNodes(root, traversal.buffers, largeHint, leaf, signature, verifiedLeaves, options.Optimize(),
-				startupCheck, verifiedClipTypes, analysis)) {
+			// All published pointers came from matching edges, even if a later
+			// edge in the same row failed. Keep their first-discovery ordinals.
+			if (replayPrefix) startupPlan->payload->links.CopyPrefix(replayPrefix, trace, signature);
+			GraphPlan::PreparedCheck startupCheck(startupPlan && !startupPlan->offline ?
+				preparedIds : std::span<const std::uint16_t>{}, replayPrefix);
+			if (!CollectReachableNodes(root, traversal.buffers, visited, replayPrefix, leaf, signature, verifiedLeaves,
+				options.Optimize(), startupCheck, verifiedClipTypes, analysis)) {
 				if (!analysis.IsCurrent()) return Outcome::changed;
 				logger::warn("[{}] '{}' could not be traversed completely. Skipping compaction.", source, name);
 				return Outcome::blocked;
 			}
-			verifiedPrefix = startupCheck.VerifiedPrefix();
+			verifiedPrefix = (std::max)(replayPrefix, startupCheck.VerifiedPrefix());
 			startupHit = startupPlan && startupCheck.Matches(nodes.size(), signature.value, startupPlan->shape.topology);
 		}
 		if (nodes.size() <= kGraphNodeThreshold) return Outcome::belowLimit;
@@ -1119,22 +1162,25 @@ namespace
 			}
 			shape = machines.Describe(signature.value);
 			classificationUs = micros(classificationStart);
-			const auto cacheReadStart = Clock::now();
-			if (options.persistentCache) lookup = GraphCache::Read(name, shape);
-			cacheReadUs = micros(cacheReadStart);
-			const auto validationStart = Clock::now();
-			hit = lookup.entry && machines.Matches(*lookup.entry, shape.topology);
-			if (persistentTopology && trace.Complete(nodes.size()) && (!hit || !lookup.prepared || !lookup.prepared->payload)) {
+			const auto offlineStart = Clock::now();
+			if (persistentTopology && trace.Complete(nodes.size())) {
 				auto offline = GraphCache::FindOffline(name, shape);
 				if (offline && machines.Matches(*offline->entry, shape.topology) &&
 					trace.SameLinks(offline->payload->links)) {
-					if (!hit) lookup = {GraphCache::Result::hit, offline->entry, GraphCache::Origin::preloaded};
-					lookup.prepared = std::move(offline);
+					lookup = {GraphCache::Result::hit, offline->entry, GraphCache::Origin::preloaded, false, false, std::move(offline)};
 					matchedOfflineLinks = true;
 					hit = true;
 				}
 			}
-			validationUs = micros(validationStart);
+			validationUs = micros(offlineStart);
+			if (!hit && options.persistentCache) {
+				const auto cacheReadStart = Clock::now();
+				lookup = GraphCache::Read(name, shape);
+				cacheReadUs = micros(cacheReadStart);
+				const auto validationStart = Clock::now();
+				hit = lookup.entry && machines.Matches(*lookup.entry, shape.topology);
+				validationUs += micros(validationStart);
+			}
 			if (!hit) {
 				const auto analysisStart = Clock::now();
 				fresh = machines.Build(shape.topology);
@@ -1160,12 +1206,12 @@ namespace
 				GraphCache::ResolvePreparedMismatch(name, *startupPlan, mismatch);
 			}
 			if (options.performanceLogging && GraphPerformance::WantsDetail()) {
-				LogGraphDetail("[{}] '{}' startup candidate mismatch, differentShape={}, matchedAlternate={}, reusedPreparedIds={}.",
-					source, name, changedShape, verifiedAlternative != nullptr, startupHit || verifiedAlternative != nullptr);
+				LogGraphDetail("[{}] '{}' startup candidate mismatch, verifiedPrefix={}, differentShape={}, matchedAlternate={}, reusedPreparedIds={}.",
+					source, name, replayPrefix, changedShape, verifiedAlternative != nullptr, startupHit || verifiedAlternative != nullptr);
 			}
 		}
-		if (verifiedAlternative) preparedIds = verifiedAlternative->IDs();
-		else if (!startupHit) preparedIds = {};
+		const auto* assignment = startupHit ? startupPlan.get() :
+			(verifiedAlternative && verifiedAlternative->entry == lookup.entry ? verifiedAlternative : nullptr);
 		const auto& plan = hit ? *lookup.entry : fresh;
 		const char* cacheState = !options.persistentCache ? "disabled" : (hit ? "hit" : "miss");
 		if (!hit && (lookup.entry || lookup.result == GraphCache::Result::invalid)) cacheState = "invalidated";
@@ -1185,7 +1231,7 @@ namespace
 		const auto analysisUs = micros(start);
 		const auto applyStart = Clock::now();
 		CommitMetrics commit;
-		const auto applied = ApplyGraphPlan(*graph, identity, nodes, plan.stateMachines, commit, nullptr, preparedIds);
+		const auto applied = ApplyGraphPlan(*graph, identity, nodes, plan.stateMachines, commit, nullptr, assignment);
 		const auto applyUs = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - applyStart - commit.lockWait).count();
 		if (!ReportApplyResult(applied, source, name)) {
 			if (applied == ApplyResult::graphChanged) return Outcome::changed;
@@ -1195,8 +1241,9 @@ namespace
 		const auto cacheWriteStart = Clock::now();
 		auto writeResult = GraphCache::WriteResult::skipped;
 		const bool attemptWrite = options.persistentCache &&
-			(!hit || legacy || lookup.retryWrite || (!lookup.persisted &&
-				((topologyHit && startupPlan->offline) || (verifiedAlternative && verifiedAlternative->offline))));
+			(!hit || legacy || lookup.retryWrite);
+		// A confirmed offline plan uses the background combined-topology writer
+		// after commit. The standalone plan remains available for retry.
 		if (hit && legacy) {
 			// The older measurement covered different work. Keep its valid plan,
 			// but start the timing baseline anew for this schema.
@@ -1286,33 +1333,30 @@ namespace
 
 	bool Thunk_PreSetupBehaviorGraph(void* a_config, RE::hkbCharacter* a_character, void* a_callback)
 	{
-		using Clock = std::chrono::steady_clock;
 		const bool logging = GraphSlimming::Options().performanceLogging;
-		const auto start = logging ? Clock::now() : Clock::time_point{};
+		GraphPerformance::HookTiming timing(logging);
 		const auto outcome = TryCompact(a_character ? a_character->behaviorGraph.get() : nullptr, "BShkbLink");
-		const auto nativeStart = logging ? Clock::now() : Clock::time_point{};
+		timing.BeginNative();
 		const bool result = g_origPreSetup(a_config, a_character, a_callback);
-		if (logging) GraphPerformance::Record(GraphPerformance::Hook::preSetup, outcome, Clock::now() - nativeStart, nativeStart - start);
+		timing.EndNative();
+		if (logging) GraphPerformance::Record(GraphPerformance::Hook::preSetup, outcome, timing.Finish(g_preSetupExternalTarget));
 		return result;
 	}
 
 	void Thunk_InitNodeIds(RE::hkbBehaviorGraph* a_graph)
 	{
-		using Clock = std::chrono::steady_clock;
 		const bool logging = GraphSlimming::Options().performanceLogging;
-		const auto start = logging ? Clock::now() : Clock::time_point{};
-		Clock::time_point nativeStart{}, nativeEnd{};
+		GraphPerformance::HookTiming timing(logging);
 		++nativeInitSequence;
 		{
 			NativeInitialization initializing(a_graph);
-			if (logging) nativeStart = Clock::now();
+			timing.BeginNative();
 			g_origInitNodeIds(a_graph);
-			if (logging) nativeEnd = Clock::now();
+			timing.EndNative();
 			initializing.MarkCompleted();
 		}
 		const auto outcome = TryCompact(a_graph, "initNodeIds");
-		if (logging) GraphPerformance::Record(GraphPerformance::Hook::initNodeIds, outcome,
-			nativeEnd - nativeStart, (nativeStart - start) + (Clock::now() - nativeEnd));
+		if (logging) GraphPerformance::Record(GraphPerformance::Hook::initNodeIds, outcome, timing.Finish(g_initNodeIdsExternalTarget));
 	}
 }
 
@@ -1401,6 +1445,8 @@ namespace Hooks
 		}
 		g_origPreSetup = reinterpret_cast<PreSetupBehaviorGraphFn>(predecessor1);
 		g_origInitNodeIds = reinterpret_cast<InitNodeIdsFn>(predecessor2);
+		g_preSetupExternalTarget = !IsExecutableTextAddress(predecessor1);
+		g_initNodeIdsExternalTarget = !IsExecutableTextAddress(predecessor2);
 		(void)trampoline.write_call<5>(*hook1Site, Thunk_PreSetupBehaviorGraph);
 		(void)trampoline.write_call<5>(*hook2Site, Thunk_InitNodeIds);
 

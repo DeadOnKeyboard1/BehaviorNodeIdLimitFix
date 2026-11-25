@@ -55,9 +55,16 @@ namespace InstanceTopology
 			UpdateNodeBudget();
 		}
 
-		void RecordEmptyNode() noexcept
+		void RecordEmptyNode() noexcept { RecordEmptyNodes(1); }
+
+		void RecordEmptyNodes(std::size_t count) noexcept
 		{
-			if (recording && ++nodeCount > nodeBudget) Discard();
+			if (!recording) return;
+			if (count > nodeBudget || nodeCount > nodeBudget - count) {
+				Discard();
+				return;
+			}
+			nodeCount += count;
 		}
 
 		[[nodiscard]] std::span<std::uint32_t> RecordChildren(std::size_t count) noexcept
@@ -216,30 +223,49 @@ namespace InstanceTopology
 		// Resolve only current pointers. The caller checks new ordinals with
 		// its identity index so two cached nodes cannot alias one live node.
 		template <class Node, class PublishNew, class Inspect>
-		[[nodiscard]] bool Replay(Node* root, std::vector<Node*>& nodes, PublishNew publish, Inspect inspect) const
+		[[nodiscard]] bool Replay(Node* root, std::vector<Node*>& nodes, PublishNew publish, Inspect inspect,
+			std::size_t* verified = nullptr) const
 		{
+			struct ReplayProgress
+			{
+				std::size_t* destination;
+				std::size_t checked{};
+				~ReplayProgress() { if (destination) *destination = checked; }
+			} progress{verified};
 			if (!Complete(nodeCount) || !root || !nodes.empty() || !publish(root, 0)) return false;
-			return WithOrdinals([&](auto ordinalAt) {
-				std::size_t row{};
+			if (edgeWidth == 2) return ReplayUsing<0xFFFFu>(nodes, publish, inspect, progress.checked,
+				[this](std::size_t index) { return PackedWord<2>(index); });
+			if (edgeWidth == 3) return ReplayUsing<0xFFFFFFu>(nodes, publish, inspect, progress.checked,
+				[this](std::size_t index) { return PackedWord<3>(index); });
+			return ReplayUsing<GraphPlan::noNode>(nodes, publish, inspect, progress.checked,
+				[this](std::size_t index) { return edges[index]; });
+		}
+
+		// Reconstruct a validated discovery prefix without reading native nodes.
+		void CopyPrefix(std::size_t verified, Trace& destination, GraphPlan::Signature& signature) const noexcept
+		{
+			verified = (std::min)(verified, nodeCount);
+			(void)WithOrdinals([&](auto ordinalAt) {
+				std::size_t next{};
 				std::uint32_t begin{};
-				for (std::size_t i = 0; i < nodeCount; ++i) {
-					if (i >= nodes.size()) return false;
-					const auto end = row < rows.size() && rows[row].ordinal == i ? rows[row++].end : begin;
-					if (!inspect(nodes[i], i, [&](std::size_t count, auto childAt) {
-						if (count != end - begin) return false;
-						for (std::size_t child = 0; child < count; ++child) {
-							const auto expected = ordinalAt(begin + child);
-							const auto live = childAt(child);
-							if (expected == GraphPlan::noNode) {
-								if (live) return false;
-							} else if (!live || (expected < nodes.size() ? nodes[expected] != live :
-								expected != nodes.size() || !publish(live, expected))) return false;
-						}
-						return true;
-					})) return false;
-					begin = end;
+				for (const auto& row : rows) {
+					if (row.ordinal >= verified) break;
+					signature.AddEmptyNodes(row.ordinal - next);
+					destination.RecordEmptyNodes(row.ordinal - next);
+					const auto count = row.end - begin;
+					signature.Add(count);
+					auto children = destination.RecordChildren(count);
+					for (std::size_t i = 0; i < count; ++i) {
+						const auto index = ordinalAt(begin + i);
+						signature.Add(index);
+						if (!children.empty()) children[i] = index;
+					}
+					begin = row.end;
+					next = row.ordinal + 1;
 				}
-				return nodes.size() == nodeCount && row == rows.size();
+				signature.AddEmptyNodes(verified - next);
+				destination.RecordEmptyNodes(verified - next);
+				return true;
 			});
 		}
 
@@ -340,6 +366,32 @@ namespace InstanceTopology
 			if (edgeWidth == 2) return use([this](std::size_t i) { return UnpackOrdinal<2>(i); });
 			if (edgeWidth == 3) return use([this](std::size_t i) { return UnpackOrdinal<3>(i); });
 			return use([this](std::size_t i) { return edges[i]; });
+		}
+
+		template <std::uint32_t nullIndex, class Node, class PublishNew, class Inspect, class ReadOrdinal>
+		[[nodiscard]] bool ReplayUsing(std::vector<Node*>& nodes, PublishNew& publish, Inspect& inspect,
+			std::size_t& checked, ReadOrdinal readOrdinal) const
+		{
+			std::size_t row{};
+			std::uint32_t begin{};
+			for (; checked < nodeCount; ++checked) {
+				if (checked >= nodes.size()) return false;
+				const auto end = row < rows.size() && rows[row].ordinal == checked ? rows[row++].end : begin;
+				if (!inspect(nodes[checked], checked, [&](std::size_t count, auto childAt) {
+					if (count != end - begin) return false;
+					for (std::size_t child = 0; child < count; ++child) {
+						const auto expected = readOrdinal(begin + child);
+						const auto live = childAt(child);
+						if (expected == nullIndex) {
+							if (live) return false;
+						} else if (!live || (expected < nodes.size() ? nodes[expected] != live :
+							expected != nodes.size() || !publish(live, expected))) return false;
+					}
+					return true;
+				})) return false;
+				begin = end;
+			}
+			return nodes.size() == nodeCount && row == rows.size();
 		}
 
 		// The root establishes liveness for ordinal zero. A matching live edge

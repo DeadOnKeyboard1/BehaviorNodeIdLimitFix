@@ -327,6 +327,12 @@ namespace OfflineGraph
 			GraphPlan::Signature topology;
 			InstanceTopology::Trace links(true);
 			std::size_t edgeCount{};
+			std::size_t emptyNodes{};
+			const auto flushEmptyNodes = [&] {
+				topology.AddEmptyNodes(emptyNodes);
+				links.RecordEmptyNodes(emptyNodes);
+				emptyNodes = 0;
+			};
 			for (std::size_t i = 0; i < nodes.size(); ++i) {
 				if ((i & 255) == 0) file.CheckStop();
 				const auto type = file.Type(nodes[i]);
@@ -336,10 +342,10 @@ namespace OfflineGraph
 				}
 				file.Children(nodes[i], type, edges);
 				if (edges.empty()) {
-					topology.AddEmptyNode();
-					links.RecordEmptyNode();
+					++emptyNodes;
 					continue;
 				}
+				if (emptyNodes) flushEmptyNodes();
 				if (edges.size() > maxEdges - edgeCount) return {};
 				edgeCount += edges.size();
 				topology.Add(static_cast<std::uint32_t>(edges.size()));
@@ -361,6 +367,7 @@ namespace OfflineGraph
 				}
 			}
 			file.CheckStop();
+			if (emptyNodes) flushEmptyNodes();
 			if (nodes.size() <= GraphPlan::nodeThreshold) return {Status::belowLimit, {}};
 			auto plan = std::make_shared<const GraphPlan::Entry>(GraphPlan::Entry{
 				topology.value, static_cast<std::uint32_t>(nodes.size()), 0, std::move(stateMachines)});

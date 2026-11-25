@@ -28,9 +28,9 @@ int main()
 		using namespace std::chrono_literals;
 		using GraphPerformance::Outcome;
 		GraphPerformance::Counters perf;
-		perf.Add(Outcome::belowLimit, 10us, 2us);
-		perf.Add(Outcome::idsInUse, 30us, 1us);
-		perf.Add(Outcome::diskTopology, 4us, 7us);
+		perf.Add(Outcome::belowLimit, {10us, 2us});
+		perf.Add(Outcome::idsInUse, {30us, 1us});
+		perf.Add(Outcome::diskTopology, {4us, 7us});
 		require(perf.calls == 3 && perf.Count(Outcome::belowLimit) == 1 &&
 			perf.Count(Outcome::idsInUse) == 1 && perf.Count(Outcome::diskTopology) == 1 &&
 			perf.Count(Outcome::full) == 0, "Performance counters omitted a short, skipped or cached graph");
@@ -40,16 +40,47 @@ int main()
 			perf.pluginLatency.P95UpperMicros(perf.calls, perf.pluginMax) == 7,
 			"The P95 upper estimate exceeded the measured maximum");
 		GraphPerformance::Counters mixedLatency;
-		for (unsigned i = 0; i < 19; ++i) mixedLatency.Add(Outcome::offlineVerified, 126us, 1us);
-		mixedLatency.Add(Outcome::offlineTopology, 30s, 999us);
+		for (unsigned i = 0; i < 19; ++i) mixedLatency.Add(Outcome::offlineVerified, {126us, 1us});
+		mixedLatency.Add(Outcome::offlineTopology, {30s, 999us});
 		require(mixedLatency.nativeLatency.P95UpperMicros(mixedLatency.calls, mixedLatency.nativeMax) == 250 &&
 			mixedLatency.pluginLatency.P95UpperMicros(mixedLatency.calls, mixedLatency.pluginMax) == 125 &&
 			mixedLatency.Count(Outcome::offlineTopology) == 1, "Latency percentiles misclassified the tail");
 		GraphPerformance::Counters longLatency;
-		longLatency.Add(Outcome::analysisBusy, 30s, 0us);
+		longLatency.Add(Outcome::analysisBusy, {30s, 0us});
 		require(longLatency.nativeLatency.P95UpperMicros(1, longLatency.nativeMax) == 30'000'000 &&
 			longLatency.pluginLatency.P95UpperMicros(1, longLatency.pluginMax) == 0,
 			"The histogram overflow bucket understated a long stall");
+		GraphPerformance::Counters initialization;
+		initialization.Add(Outcome::full, {20ms, 3ms, 9ms, 2, true});
+		initialization.Add(Outcome::instance, {65ms, 2ms});
+		require(initialization.nativeTotal == 85ms && initialization.nativeExclusive.total == 76ms &&
+			initialization.nativeExclusive.Mean() == 38ms && initialization.nativeExclusive.maximum == 65ms &&
+			initialization.nestedCalls == 2 && initialization.nestedTime == 9ms && initialization.externalTargets == 1 &&
+			initialization.slow16ms == 2 && initialization.slow50ms == 1,
+			"Nested or external Havok calls distorted timing or slow-call counts");
+		GraphPerformance::HookTiming outer(true);
+		outer.BeginNative();
+		{
+			GraphPerformance::HookTiming inner(true);
+			inner.BeginNative();
+			{
+				GraphPerformance::HookTiming deepest(true);
+				deepest.BeginNative();
+				deepest.EndNative();
+			}
+			inner.EndNative();
+			require(inner.Finish(false).nestedCalls == 1, "Innermost Havok hook was not attributed to its direct parent");
+		}
+		outer.EndNative();
+		{
+			GraphPerformance::HookTiming outside(true);
+			outside.BeginNative();
+			outside.EndNative();
+		}
+		const auto measured = outer.Finish(false);
+		require(measured.nestedCalls == 1 && measured.native >= measured.nestedTime &&
+			measured.NativeExclusive() + measured.nestedTime == measured.native,
+			"Nested work was charged twice or attributed outside the native call");
 	}
 	Signature shape;
 	for (const auto ordinal : { 2u, 1u, 2u, 0u, 1u, 0u }) shape.Add(ordinal);
@@ -804,6 +835,23 @@ int main()
 	require(!offlineOnly.FindPrepared(offlineKey.graph) && !offlineOnly.Read(offlineKey).entry &&
 		offlineOnly.FindOffline(offlineKey) == offlineCandidate,
 		"A failed offline replay stopped exact lookup or leaked into the ordinary cache");
+	{
+		const auto publication = bakedDirectory / "offline-publication";
+		Store publisher(publication);
+		require(publisher.AdmitOffline(offlineKey, bakedShape, GraphSlimming::Payload{bakedPayload}),
+			"Could not admit the offline publication fixture");
+		const auto candidate = publisher.FindOffline(offlineKey);
+		require(candidate && !publisher.ClaimTopology(offlineKey, *candidate->entry, start, false).ticket &&
+			!publisher.Read(offlineKey).entry, "A full queue published an uncommitted offline plan");
+		const auto job = publisher.ClaimTopology(offlineKey, *candidate->entry);
+		require(job.ticket && !publisher.Read(offlineKey).persisted &&
+			publisher.SaveTopology(offlineKey, job.ticket, *candidate->payload) &&
+			publisher.Read(offlineKey).persisted, "Live-confirmed offline topology required a standalone plan write");
+		require(Store(publication).Preload(1, Store::Clock::now() + 5s, cancelled, nullptr).baked == 1,
+			"A restart could not preload the published offline topology");
+		for (const auto& file : std::filesystem::directory_iterator(publication)) std::filesystem::remove(file.path());
+		std::filesystem::remove(publication);
+	}
 	StateMachines offlineOther(bakedPlan->nodes);
 	offlineOther.Add(0);
 	offlineOther.Add(5);
@@ -816,11 +864,11 @@ int main()
 		offlineOnly.FindOffline(offlineKey) == offlineCandidate,
 		"A second offline shape displaced an existing exact candidate or remained speculative");
 	bool admittedLimit = true;
-	for (unsigned i = 0; i < 14; ++i) {
+	for (unsigned i = 0; i < 254; ++i) {
 		admittedLimit &= offlineOnly.AdmitOffline({offlineKey.graph + i + 1, offlineKey.shape},
 			bakedShape, GraphSlimming::Payload{bakedPayload});
 	}
-	require(admittedLimit && !offlineOnly.AdmitOffline({offlineKey.graph + 100, offlineKey.shape},
+	require(admittedLimit && !offlineOnly.AdmitOffline({offlineKey.graph + 300, offlineKey.shape},
 		bakedShape, GraphSlimming::Payload{bakedPayload}), "Offline admission exceeded the resident plan limit");
 	{
 		Store simultaneous(bakedDirectory);
@@ -937,14 +985,21 @@ int main()
 				const std::size_t phase = behavior ? 0 : 1;
 				selectedAssets[phase] = selected;
 				checkedAssets[phase] = checked;
-			});
+			}, {}, true);
 		require(!scan.interrupted && !scan.catalogLimited && scan.behaviorFiles == 1 && scan.animationFiles == 2 && scan.bytes == 288 &&
 			scan.selected == 3 && scan.checked == 3, "File preload missed active HKX or scanned unrelated assets");
+		require(scan.behaviorIO.open.samples == 1 && scan.behaviorIO.fileRead.samples == 1 &&
+			scan.behaviorIO.bytes == 128 && scan.behaviorIO.readCalls == 1 &&
+			scan.animationIO.open.samples == 2 && scan.animationIO.fileRead.samples == 2 &&
+			scan.animationIO.bytes == 160 && scan.animationIO.readCalls == 2 &&
+			!scan.animationIO.failedReads && !scan.behaviorIO.shortReads,
+			"HKX timing included unrelated files or mixed behavior and animation reads");
 		require(scan.scannedDirectories == 7, "An already covered OAR directory was enumerated again without a persistent index");
 		require(selectedAssets == std::array{1u, 2u} && checkedAssets == selectedAssets,
 			"File progress did not report real behavior and animation work");
 		const auto constrained = AnimationPreload::Warm(meshes, 128, Store::Clock::now() + 5s, cancelled, nullptr);
-		require(constrained.behaviorFiles == 1 && constrained.animationFiles == 0 && constrained.bytes == 128,
+		require(constrained.behaviorFiles == 1 && constrained.animationFiles == 0 && constrained.bytes == 128 &&
+			!constrained.behaviorIO.readCalls && !constrained.behaviorIO.open.samples,
 			"File preload failed to prioritize behavior data within its byte budget");
 		const auto prioritized = AnimationPreload::Warm(meshes, 224, Store::Clock::now() + 5s, cancelled, nullptr);
 		require(prioritized.behaviorFiles == 1 && prioritized.animationFiles == 1 && prioritized.bytes == 192 &&

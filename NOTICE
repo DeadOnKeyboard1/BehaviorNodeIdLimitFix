@@ -1,0 +1,20 @@
+NOTICE — Third-Party & Upstream Notices
+
+1. BehaviorNodeIdLimitFix
+   Authored by DoK (DeadOnKeyboard).
+   Licensed under GNU General Public License v3.0 or later (see LICENSE) together with
+   CommonLibSSE-NG linking and modding exceptions (see EXCEPTIONS.md).
+
+2. CommonLibSSE-NG
+   Built against alandtse/CommonLibSSE-NG v16.7.0
+   (commit 0174fa6c22c59a1bbd89dd01fae6d09d3f2aaef8), licensed under GPL-3.0-or-later
+   with Modding Exception and GPL-3.0 Linking Exception (EXCEPTIONS.md).
+   Incorporates original CommonLibSSE work (Copyright (c) 2018 Ryan-rsm-McKenzie, MIT).
+
+3. Hacker Disassembler Engine 64 C (HDE64, via MinHook v1.3.4)
+   Copyright (c) 2008-2009, Vyacheslav Patkov.
+   All rights reserved.
+   MinHook Copyright (C) 2009-2017 Tsuda Kageyu.
+   Redistribution and use in source and binary forms, with or without modification,
+   are permitted under the BSD 2-Clause terms provided copyright notices, conditions,
+   and disclaimers are retained in documentation/distribution.

@@ -185,16 +185,21 @@ int main()
 			return true;
 		};
 		const auto prepare = [&] {
-			return OfflineGraph::Prepare(meshes, cache, stop, publish, nullptr);
+			return OfflineGraph::Prepare(meshes, cache, stop, publish, nullptr, 128, true);
 		};
 		write();
 		const auto first = prepare();
 		Require(first.checked == 1 && first.built == 1 && first.admitted == 1 && !first.reused &&
 			first.sourceBytesRead == file.size(),
 			"Cold startup did not bake the graph");
+		Require(first.sourceIO.open.samples == 1 && first.sourceIO.fileRead.samples == 1 &&
+			first.sourceIO.readCalls > 1 && first.sourceIO.bytes == file.size() && first.sourceDecode.samples == 1,
+			"Offline HKX opening, chunk reads and decoding were not counted independently");
 		const auto second = prepare();
 		Require(second.reused == 1 && !second.built && second.admitted == 1 && published == 2 && second.sourceBytesRead == 0,
 			"Restart rebuilt an unchanged graph or lost its plan");
+		Require(second.sourceIO.open.samples == 1 && !second.sourceIO.fileRead.samples &&
+			!second.sourceIO.bytes && !second.sourceDecode.samples, "A cached plan was counted as an HKX source read or decode");
 
 		const auto cacheFile = fs::directory_iterator(cache)->path();
 		{
@@ -254,9 +259,12 @@ int main()
 			}
 			const auto priorityCache = root / L"priority-cache";
 			const auto firstPriority = OfflineGraph::Prepare(meshes, priorityCache, stop, publish, nullptr);
-			Require(firstPriority.checked == 32 && firstPriority.built == 1 && firstPriority.admitted == 1 &&
-				firstPriority.unsupported == 31 && firstPriority.sourceBytesRead == playable.size() + 31 * OfflineGraph::packfileHeaderBytes,
-				"Creature files crowded the first-person character graph out of the bounded startup catalog");
+			Require(firstPriority.checked == 38 && firstPriority.built == 1 && firstPriority.admitted == 1 &&
+				firstPriority.unsupported == 37 && firstPriority.sourceBytesRead == playable.size() + 37 * OfflineGraph::packfileHeaderBytes,
+				"The expanded scan missed first-person or creature candidates");
+			const auto capped = OfflineGraph::Prepare(meshes, priorityCache, stop, publish, nullptr, 0);
+			Require(capped.checked == firstPriority.checked && capped.notAdmitted == 1 &&
+				!capped.admitted && !capped.sourceBytesRead, "A resident plan limit truncated file discovery");
 			const auto warmPriority = OfflineGraph::Prepare(meshes, priorityCache, stop, publish, nullptr);
 			Require(warmPriority.checked == firstPriority.checked && warmPriority.reused == firstPriority.checked &&
 				warmPriority.admitted == 1 && warmPriority.sourceBytesRead == 0,

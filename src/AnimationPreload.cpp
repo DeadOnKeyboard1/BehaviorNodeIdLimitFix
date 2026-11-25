@@ -117,10 +117,13 @@ namespace
 	};
 
 	ReadResult WarmFile(const Path& path, std::uint64_t budget, std::array<std::byte, 128 * 1024>& buffer,
-		const std::atomic_bool& stop, Clock::time_point deadline) noexcept
+		const std::atomic_bool& stop, Clock::time_point deadline, HkxTiming::Stats* stats) noexcept
 	{
+		HkxTiming::File timing(stats);
+		const auto openStart = timing.Now();
 		const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
 			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+		timing.Opened(openStart, file != INVALID_HANDLE_VALUE);
 		if (file == INVALID_HANDLE_VALUE) return {};
 		const std::unique_ptr<void, decltype(&CloseHandle)> closeFile(file, CloseHandle);
 		BY_HANDLE_FILE_INFORMATION info{};
@@ -134,7 +137,10 @@ namespace
 				(deadline != (Clock::time_point::max)() && Clock::now() >= deadline)) break;
 			const auto count = static_cast<DWORD>((std::min)(remaining, static_cast<std::uint64_t>(buffer.size())));
 			DWORD read{};
-			if (!ReadFile(file, buffer.data(), count, &read, nullptr)) break;
+			const auto readStart = timing.Now();
+			const bool success = ReadFile(file, buffer.data(), count, &read, nullptr) != FALSE;
+			timing.Read(readStart, success, read, count);
+			if (!success) break;
 			remaining -= read;
 			if (read != count) break;
 		}
@@ -158,7 +164,7 @@ namespace AnimationPreload
 	}
 
 	Summary Warm(const std::filesystem::path& meshes, std::uint64_t budget, Clock::time_point deadline,
-		const std::atomic_bool& stop, Progress progress, const std::filesystem::path& indexFile) noexcept
+		const std::atomic_bool& stop, Progress progress, const std::filesystem::path& indexFile, bool measureIO) noexcept
 	{
 		Summary summary;
 		try {
@@ -181,7 +187,8 @@ namespace AnimationPreload
 						break;
 					}
 					if (summary.bytes == budget) break;
-					const auto read = WarmFile(path, budget - summary.bytes, buffer, stop, deadline);
+					auto* timing = measureIO ? (behavior ? &summary.behaviorIO : &summary.animationIO) : nullptr;
+				const auto read = WarmFile(path, budget - summary.bytes, buffer, stop, deadline, timing);
 					summary.bytes += read.bytes;
 					if (read.complete) {
 						if (behavior) ++summary.behaviorFiles;

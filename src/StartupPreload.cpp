@@ -222,6 +222,16 @@ namespace
 			std::memory_order_release);
 	}
 
+	void LogHkxIO(const char* source, const HkxTiming::Stats& io)
+	{
+		const auto micros = [](auto duration) { return std::chrono::duration_cast<std::chrono::microseconds>(duration).count(); };
+		logger::info("HKX loading [{}] openCalls={} failedOpens={} openTotal={}us openMax={}us filesRead={} readCalls={} "
+			"failedReads={} shortReads={} bytesRead={} readTotal={}us readMeanPerFile={}us readP95UpperPerFile={}us readMaxPerFile={}us",
+			source, io.open.samples, io.failedOpens, micros(io.open.total), micros(io.open.maximum), io.fileRead.samples,
+			io.readCalls, io.failedReads, io.shortReads, io.bytes, micros(io.fileRead.total), micros(io.fileRead.Mean()),
+			io.fileRead.P95UpperMicros(), micros(io.fileRead.maximum));
+	}
+
 	DWORD WINAPI WarmCache(void* context) noexcept
 	{
 		std::unique_ptr<EventOwner> events(static_cast<EventOwner*>(context));
@@ -243,7 +253,8 @@ namespace
 				const auto game = std::filesystem::path(REL::Module::get().filePath().data()).parent_path();
 				offline = OfflineGraph::Prepare(game / L"Data/meshes", game / L"Data/SKSE/Plugins/BehaviorNodeIdLimitFix/Cache/Offline",
 					startupEnded, GraphCache::AdmitOffline,
-					[](unsigned checked, unsigned selected) noexcept { ReportProgress(Phase::offline, checked, selected); });
+					[](unsigned checked, unsigned selected) noexcept { ReportProgress(Phase::offline, checked, selected); },
+					settings.preloadMaxPlans, settings.performanceLogging);
 			}
 		} catch (const std::exception&) {
 			offline.interrupted = true;
@@ -266,7 +277,7 @@ namespace
 						[](bool behavior, unsigned checked, unsigned selected) noexcept {
 							const auto phase = behavior ? Phase::behaviors : Phase::animations;
 							ReportProgress(selected ? phase : Phase::catalog, checked, selected);
-						}, indexFile);
+						}, indexFile, settings.performanceLogging);
 					if (background) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
 				}
 			} catch (const std::exception&) {
@@ -289,8 +300,14 @@ namespace
 			if (settings.offlineGraphPreparation && settings.persistentCache) {
 				const auto offlineElapsed = std::chrono::duration_cast<std::chrono::microseconds>(offlineDone - plansDone).count();
 				logger::info("Startup offline graphs: checked={} reused={} built={} admitted={} belowLimit={} unsupported={} "
-					"sourceBytesRead={} elapsed={}us interrupted={}", offline.checked, offline.reused, offline.built, offline.admitted,
-					offline.belowLimit, offline.unsupported, offline.sourceBytesRead, offlineElapsed, offline.interrupted);
+					"deferred={} notAdmitted={} sourceBytesRead={} elapsed={}us interrupted={} catalogLimited={} virtualFilesystem={}",
+					offline.checked, offline.reused, offline.built, offline.admitted, offline.belowLimit, offline.unsupported,
+					offline.deferred, offline.notAdmitted, offline.sourceBytesRead, offlineElapsed, offline.interrupted,
+					offline.catalogLimited, offline.virtualFilesystem);
+				LogHkxIO("offline-graph-sources", offline.sourceIO);
+				logger::info("HKX offline decode: files={} total={}us max={}us", offline.sourceDecode.samples,
+					std::chrono::duration_cast<std::chrono::microseconds>(offline.sourceDecode.total).count(),
+					std::chrono::duration_cast<std::chrono::microseconds>(offline.sourceDecode.maximum).count());
 			}
 			if (settings.preloadAnimationFiles) {
 				const auto animationElapsed = std::chrono::duration_cast<std::chrono::microseconds>(animationDone - offlineDone).count();
@@ -299,6 +316,10 @@ namespace
 					animationStats.selected, animationStats.checked, animationStats.behaviorFiles, animationStats.animationFiles,
 					animationStats.bytes, assetBudget, animationElapsed, animationStats.indexedDirectories, animationStats.scannedDirectories,
 					animationStats.indexSaved, animationStats.indexLimited, animationStats.catalogLimited, animationStats.interrupted);
+				LogHkxIO("behavior-preload", animationStats.behaviorIO);
+				LogHkxIO("animation-preload", animationStats.animationIO);
+			} else {
+				logger::info("HKX loading [file-cache-preload] disabled (bPreloadAnimationFiles=false).");
 			}
 			if (auto* log = spdlog::default_logger_raw()) log->flush();
 		}

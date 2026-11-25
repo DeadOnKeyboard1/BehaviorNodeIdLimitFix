@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <bit>
 #include <cstring>
@@ -184,7 +185,8 @@ namespace GraphPlan
 	class PreparedCheck
 	{
 	public:
-		explicit PreparedCheck(std::span<const std::uint16_t> ids) : ids(ids), matching(!ids.empty()) {}
+		explicit PreparedCheck(std::span<const std::uint16_t> ids, std::size_t verified = 0) :
+			ids(ids), prefix((std::min)(verified, ids.size())), matching(!ids.empty() && prefix == verified) {}
 
 		template <class IsMachine>
 		void Observe(std::size_t ordinal, IsMachine isMachine)

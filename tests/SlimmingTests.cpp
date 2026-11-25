@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
+#include <new>
 #include <sstream>
 #include <thread>
 
@@ -78,6 +80,18 @@ int main()
 		require(sequential.value == grouped.value, "A grouped leaf run changed the topology fingerprint");
 	}
 	auto small = MakeTrace(64);
+	InstanceTopology::Trace batched(true);
+	auto batchedRoot = batched.RecordChildren(64);
+	batchedRoot[0] = GraphPlan::noNode;
+	for (std::uint32_t i = 1; i < 64; ++i) batchedRoot[i] = i;
+	batched.RecordChildren(1)[0] = 0;
+	batched.RecordEmptyNodes(62);
+	require(batched.SameLinks(small), "Batching consecutive leaves changed discovery order");
+	batched.RecordEmptyNodes((std::numeric_limits<std::size_t>::max)());
+	require(!batched.Complete(64) && !batched.CapacityBytes(), "An oversized leaf run wrapped or retained a partial trace");
+	batched.Reset();
+	batched.RecordEmptyNodes(1);
+	require(batched.Complete(1), "A discarded batched trace could not be reused");
 	auto packedSmall = small;
 	require(packedSmall.PackOrdinals() && small.SameLinks(packedSmall) && packedSmall.SameLinks(small),
 		"Small graph changed meaning after 16-bit packing");
@@ -146,22 +160,34 @@ int main()
 		"A partial topology file validated");
 	std::array<unsigned, 64> nativeNodes{};
 	std::vector<unsigned*> resolved;
-	const auto replay = [&](bool alias) {
+	std::size_t checked{};
+	const auto replay = [&](bool alias, bool interrupt = false) {
 		resolved.clear();
 		return reloaded->Replay(&nativeNodes[0], resolved, [&](auto* node, std::size_t expected) {
 			if (std::ranges::find(resolved, node) != resolved.end() || expected != resolved.size()) return false;
 			resolved.push_back(node);
 			return true;
 		}, [&](auto* node, std::size_t i, auto check) {
+			if (interrupt && i == 17) throw std::bad_alloc{};
 			return node == &nativeNodes[i] && check(i == 0 ? 64u : (i == 1 ? 1u : 0u), [&](auto edge) -> unsigned* {
 				if (i == 1) return &nativeNodes[0];
 				if (edge == 0) return nullptr;
 				return &nativeNodes[alias && edge == 2 ? 1 : edge];
 			});
-		});
+		}, &checked);
 	};
-	require(replay(false) && resolved.size() == nativeNodes.size(), "Saved edges failed to resolve freshly loaded nodes");
-	require(!replay(true), "Replay accepted two cached ordinals for the same live node");
+	require(replay(false) && resolved.size() == nativeNodes.size() && checked == nativeNodes.size(),
+		"Saved edges failed to resolve freshly loaded nodes");
+	require(!replay(true) && checked == 0 && resolved.size() == 2,
+		"Replay accepted aliases or dropped valid discoveries before a mismatch inside a row");
+	bool interrupted{};
+	try {
+		(void)replay(false, true);
+	} catch (const std::bad_alloc&) {
+		interrupted = true;
+	}
+	require(interrupted && checked == 17 && resolved.size() == nativeNodes.size(),
+		"Interrupted replay lost its last confirmed row or its discovered nodes");
 	packedSmall.RecordEmptyNode();
 	require(packedSmall.Complete(64), "A sealed trace accepted an extra leaf");
 	packedSmall.Reset();
@@ -233,6 +259,7 @@ int main()
 		if (count == 65'536u) {
 			std::vector<Node*> replayed;
 			replayed.reserve(count);
+			std::size_t verified{};
 			const auto replayTrace = [&](const InstanceTopology::Trace& graph) {
 				replayed.clear();
 				return graph.Replay(live.front(), replayed, [&](Node* node, std::size_t expectedOrdinal) {
@@ -240,14 +267,25 @@ int main()
 						live[expectedOrdinal] != node) return false;
 					replayed.push_back(node);
 					return true;
-				}, inspect);
+				}, inspect, &verified);
 			};
 			require(replayTrace(a.payload->links) && replayed == live &&
 				replayTrace(off.payload->links) && replayed == live,
 				"Raw or 24-bit replay lost the last ordinal or confused it with a null edge");
 			addTransition = true;
-			require(!replayTrace(a.payload->links) && !replayTrace(off.payload->links),
-				"Raw or 24-bit replay accepted a changed edge");
+			require(!replayTrace(a.payload->links) && verified == 1 && replayed == live &&
+				!replayTrace(off.payload->links) && verified == 1 && replayed == live,
+				"Replay lost the discovered pointers or the verified prefix after a changed edge");
+			InstanceTopology::Trace resumed(true);
+			GraphPlan::Signature signature;
+			a.payload->links.CopyPrefix(verified, resumed, signature);
+			signature.Add(1);
+			signature.Add(1);
+			resumed.RecordChildren(1)[0] = 1;
+			signature.AddEmptyNodes(count - 2);
+			for (std::uint32_t i = 2; i < count; ++i) resumed.RecordEmptyNode();
+			require(resumed.Complete(count) && !resumed.SameLinks(off.payload->links) &&
+				signature.value != shape.topology, "Resuming from the confirmed prefix reused a changed topology");
 		}
 		a.payload.reset();
 		require(b.payload->plan->stateMachines.front() == 1, "One actor invalidated another actor's plan lifetime");

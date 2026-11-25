@@ -23,8 +23,8 @@ namespace
 	constexpr std::size_t preparedByteLimit = 32 * 1024 * 1024;
 	constexpr std::size_t preparedPlanLimit = 4 * 1024 * 1024;
 	constexpr std::size_t topologyByteLimit = 24 * 1024 * 1024;
-	constexpr std::size_t offlineByteLimit = 24 * 1024 * 1024;
-	constexpr unsigned offlinePlanLimit = 16;
+	constexpr std::size_t offlineByteLimit = 64 * 1024 * 1024;
+	constexpr unsigned offlinePlanLimit = 256;
 	constexpr std::uint64_t graphStorageVersion = 0x31454C444E425247ULL;
 	constexpr std::size_t graphHeaderBytes = 3 * sizeof(std::uint64_t) + sizeof(std::uint32_t);
 	constexpr std::size_t minGraphFileBytes = graphHeaderBytes + GraphPlan::headerSize;
@@ -616,8 +616,19 @@ namespace GraphCache
 	Store::TopologyClaim Store::ClaimTopology(Key key, const GraphPlan::Entry& plan, Clock::time_point now, bool allowNewJob)
 	{
 		std::scoped_lock lock(memoryMutex);
-		const auto item = loaded.find(key);
-		if (item == loaded.end()) return {};
+		auto item = loaded.find(key);
+		if (item == loaded.end()) {
+			if (!allowNewJob || directory.empty()) return {};
+			const auto offline = offlineGraphs.find(key.graph);
+			if (offline == offlineGraphs.end()) return {};
+			const auto& variants = offline->second.plans;
+			const auto match = std::ranges::find_if(variants, [&](const auto& candidate) {
+				return candidate->entry.get() == &plan && candidate->shape.CacheVariant() == key.shape;
+			});
+			// Only a live-confirmed payload submitted by the commit path gets a ticket.
+			if (match == variants.end() || !MakeRoom()) return {};
+			item = loaded.emplace(key, Record{.entry = (*match)->entry, .retryAfter = now + retryDelay}).first;
+		}
 		auto& record = item->second;
 		if (!record.topologySaved && (!allowNewJob || record.topologyTicket ||
 			(record.topologyRetryAfter && now < *record.topologyRetryAfter))) return {};

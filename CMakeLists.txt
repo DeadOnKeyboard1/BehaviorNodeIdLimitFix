@@ -14,7 +14,7 @@ set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "Embedded" CACHE STRING "" FORCE)
 
 project(
     BehaviorNodeIdLimitFix
-    VERSION 2.5.0
+    VERSION 2.5.3
     LANGUAGES CXX
 )
 
